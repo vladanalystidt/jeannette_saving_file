@@ -1,0 +1,741 @@
+// ============================================================
+// Looker API config
+// ============================================================
+// NOTE (копия в проекте): CLIENT_ID / CLIENT_SECRET заменены плейсхолдерами,
+// чтобы креды не лежали в общих документах проекта. В рабочем Apps Script
+// стоят реальные значения — при восстановлении из этой копии взять их оттуда.
+const LOOKER_CONFIG = {
+  BASE:          'https://idttelecom.looker.com',
+  CLIENT_ID:     '<<LOOKER_CLIENT_ID — see live Apps Script>>',
+  CLIENT_SECRET: '<<LOOKER_CLIENT_SECRET — see live Apps Script>>',
+  LOOK_ID:       10569
+};
+
+// ============================================================
+// Looker statuses excluded from reconciliation
+// ============================================================
+// Rows whose status (col C) is listed here still land on the "looker"
+// sheet untouched — that tab stays a raw dump of the Look — but they are
+// NOT fed into recon / recon_v2 (matching, totals, daily totals).
+// Rationale: a rejected payment never left the account, so it has no
+// counterpart in Distribucion. Left in, it either grabs a 1-to-1 match
+// away from a real payment of the same amount or shows up as a phantom
+// variance on recon_v2. Add more statuses here if others ever need the
+// same treatment.
+const EXCLUDED_LOOKER_STATUSES = ['rejected'];
+
+function isExcludedLookerStatus_(status) {
+  return EXCLUDED_LOOKER_STATUSES.indexOf(String(status).trim().toLowerCase()) !== -1;
+}
+
+// ============================================================
+// Email selection window
+// ============================================================
+// "Today" for BOTH the Distribucion candidates and the optional
+// "Pagos adicionales" 3rd source is evaluated in this timezone,
+// NOT the Apps Script project's default timezone. Using the IANA
+// zone name (rather than a fixed UTC-5 offset) means DST is handled
+// automatically — this is "US Eastern time" year-round, EST in
+// winter / EDT in summer, which is what "EST" means in practice for
+// a business schedule. Change this single constant if the cutover
+// ever needs to move to a different zone.
+const EST_TZ = 'America/New_York';
+
+// Auth — get access token
+function getLookerToken_() {
+  const resp = UrlFetchApp.fetch(`${LOOKER_CONFIG.BASE}/api/4.0/login`, {
+    method: 'POST',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: `client_id=${encodeURIComponent(LOOKER_CONFIG.CLIENT_ID)}&client_secret=${encodeURIComponent(LOOKER_CONFIG.CLIENT_SECRET)}`,
+    muteHttpExceptions: true
+  });
+  if (resp.getResponseCode() !== 200) {
+    throw new Error(`Looker auth failed [${resp.getResponseCode()}]: ${resp.getContentText()}`);
+  }
+  const token = JSON.parse(resp.getContentText()).access_token;
+  if (!token) throw new Error('No token returned — check CLIENT_ID / CLIENT_SECRET');
+  return token;
+}
+
+// Run the Look and return parsed CSV (2D array, incl. header row)
+function fetchLookData_() {
+  const token = getLookerToken_();
+  const resp = UrlFetchApp.fetch(
+    `${LOOKER_CONFIG.BASE}/api/4.0/looks/${LOOKER_CONFIG.LOOK_ID}/run/csv?cache=false`, {
+    method: 'GET',
+    headers: { 'Authorization': `token ${token}` },
+    muteHttpExceptions: true
+  });
+  if (resp.getResponseCode() !== 200) {
+    throw new Error(`Looker run failed [${resp.getResponseCode()}]: ${resp.getContentText()}`);
+  }
+  return Utilities.parseCsv(resp.getContentText());
+}
+
+
+function parseDistribucionEmail() {
+  const SPREADSHEET_ID = '1lQycsnTpmvJtQ0G9wVYadqIsyHXwecHwctQXxJSRUnI';
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  const logSheet = getOrCreateSheet(ss, 'log');
+  logSheet.clearContents();
+  logSheet.getRange(1, 1, 1, 2).setValues([['Timestamp', 'Message']]);
+  logSheet.getRange(1, 1, 1, 2).setFontWeight('bold');
+
+  let logRow = 2;
+
+  function log(msg) {
+    Logger.log(msg);
+    logSheet.getRange(logRow, 1, 1, 2).setValues([[new Date(), msg]]);
+    logRow++;
+  }
+
+  try {
+    log('Script started');
+
+    const mailSheet    = getOrCreateSheet(ss, 'mail');
+    const prevDaySheet = getOrCreateSheet(ss, 'mail_prev_day');
+    const pagosSheet   = getOrCreateSheet(ss, 'mail_pagos_adicionales'); // optional 3rd source, filled only if a same-day (EST) "Pagos adicionales" email exists
+    const lookerSheet  = getOrCreateSheet(ss, 'looker');
+    const reconSheet   = getOrCreateSheet(ss, 'recon');
+
+    mailSheet.clearContents();
+    prevDaySheet.clearContents();
+    pagosSheet.clearContents();
+    lookerSheet.clearContents();
+
+    // FIX: clear both content AND background of recon — otherwise old colors stay
+    reconSheet.clearContents();
+    const reconMaxRow = Math.max(reconSheet.getMaxRows(), 1);
+    const reconMaxCol = Math.max(reconSheet.getMaxColumns(), 1);
+    reconSheet.getRange(1, 1, reconMaxRow, reconMaxCol).setBackground(null);
+
+    log('Sheets cleared: mail, mail_prev_day, mail_pagos_adicionales, looker, recon');
+
+    // ── BLOCK 1: Distribucion ────────────────────────────────────────
+    log('--- Searching Distribucion emails ---');
+    const threads = GmailApp.search('subject:Distribucion', 0, 50);
+    log('Threads found: ' + threads.length);
+
+    // "Today" window: candidates must fall on the current calendar day
+    // in EST_TZ. Replaces the old 48h rolling cutoff — a rolling window
+    // could silently fall back to a stale prior-day email (e.g. when
+    // today's email has a malformed subject/body and gets skipped), which
+    // is worse than simply leaving mail_prev_day empty and visible in the
+    // log.
+    const now     = new Date();
+    const todayKey = Utilities.formatDate(now, EST_TZ, 'dd/MM/yyyy');
+    log('Today (EST) = ' + todayKey);
+
+    if (threads.length === 0) {
+      log('WARNING: No threads found with subject Distribucion');
+    } else {
+      const candidates = [];
+
+      for (const thread of threads) {
+        const messages = thread.getMessages();
+        for (const msg of messages) {
+          const subject = msg.getSubject();
+          if (/^\s*(RE|Re|FW|Fwd)\s*:/i.test(subject)) {
+            log('[SKIP] "' + subject + '" — reply/forward ignored');
+            continue;
+          }
+          const date = msg.getDate();
+
+          // Hard cutoff: only messages dated "today" in EST_TZ are
+          // considered at all, before even checking table content.
+          const msgDateKey = Utilities.formatDate(date, EST_TZ, 'dd/MM/yyyy');
+          if (msgDateKey !== todayKey) {
+            log('[SKIP] "' + subject + '" | ' + date + ' — not today in EST (msg=' + msgDateKey + ', today=' + todayKey + '), ignored');
+            continue;
+          }
+
+          const body = getMessageBody(msg);
+          const rows = parseTableFromBody(body);
+          log('[CHECK] "' + subject + '" | ' + date + ' | bodyLen: ' + body.length + ' | rows: ' + rows.length);
+          if (rows.length > 0) {
+            candidates.push({ msg, rows });
+            log('[OK] Added as candidate with ' + rows.length + ' rows');
+          } else {
+            log('[SKIP] No table rows found in: "' + subject + '"');
+          }
+        }
+      }
+
+      candidates.sort((a, b) => b.msg.getDate() - a.msg.getDate());
+      log('Total valid Distribucion candidates (today, EST): ' + candidates.length);
+
+      if (candidates.length === 0) {
+        log('ERROR: No Distribucion messages with parseable table data found for today (EST)');
+      } else {
+        const latest = candidates[0];
+        log('Latest → mail: "' + latest.msg.getSubject() + '" | ' + latest.msg.getDate());
+        writeToSheet(latest.msg, latest.rows, mailSheet, log);
+
+        if (candidates.length >= 2) {
+          const prev = candidates[1];
+          log('Prev → mail_prev_day: "' + prev.msg.getSubject() + '" | ' + prev.msg.getDate());
+          writeToSheet(prev.msg, prev.rows, prevDaySheet, log);
+        } else {
+          log('WARNING: Only one valid candidate found for today (EST), mail_prev_day will remain empty');
+        }
+      }
+    }
+
+    // ── BLOCK 1B: Pagos adicionales (optional 3rd source, same-day EST only) ─
+    log('--- Checking for "Pagos adicionales" email (today only, EST) ---');
+    try {
+      const pagosResult = findPagosAdicionalesCandidate_(log);
+      if (pagosResult) {
+        log('Pagos adicionales → mail_pagos_adicionales: "' + pagosResult.msg.getSubject() + '" | ' + pagosResult.msg.getDate());
+        writeToSheet(pagosResult.msg, pagosResult.rows, pagosSheet, log);
+      } else {
+        log('No "Pagos adicionales" email found for today (EST) — normal, this happens roughly weekly, not daily');
+      }
+    } catch (e) {
+      log('ERROR: Pagos adicionales block failed — ' + e.message);
+    }
+
+    // ── BLOCK 2: Looker report via API ──────────────────────────────
+    log('--- Fetching Looker report via API ---');
+    loadLookerReport(ss, lookerSheet, log);
+
+    // ── BLOCK 3: RECON (buildRecon lives in recon_summary.gs) ────────
+    log('--- Building recon sheet ---');
+    buildRecon(ss, mailSheet, prevDaySheet, lookerSheet, reconSheet, log);
+
+    // ── BLOCK 4: RECON V2 ────────────────────────────────────────────
+    log('--- Building recon_v2 sheet ---');
+    buildReconV2(ss, mailSheet, prevDaySheet, pagosSheet, lookerSheet, log);
+
+    log('Script finished successfully');
+
+  } catch (e) {
+    log('EXCEPTION: ' + e.message);
+    log('Stack: ' + e.stack);
+  } finally {
+    logSheet.autoResizeColumns(1, 2);
+  }
+}
+
+
+// ── Looker Look → looker sheet (via API) ─────────────────────────────
+function loadLookerReport(ss, lookerSheet, log) {
+  let data;
+  try {
+    data = fetchLookData_();
+  } catch (e) {
+    log('ERROR: Looker API fetch failed — ' + e.message);
+    return;
+  }
+
+  if (!data || data.length === 0) {
+    log('ERROR: Looker returned an empty response');
+    return;
+  }
+  log('Looker rows received (incl. header): ' + data.length);
+
+  // Strip thousands separators from Amount (col I / idx 8) and Local amount (col J / idx 9)
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][8]) data[i][8] = String(data[i][8]).replace(/,/g, '');
+    if (data[i][9]) data[i][9] = String(data[i][9]).replace(/,/g, '');
+  }
+
+  lookerSheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+  lookerSheet.getRange(1, 1, 1, data[0].length).setFontWeight('bold');
+  lookerSheet.autoResizeColumns(1, data[0].length);
+
+  // Meta block — keep "Source file:" label so recon readers break on it
+  const metaRow = data.length + 2;
+  lookerSheet.getRange(metaRow, 1, 3, 2).setValues([
+    ['Source file:', 'Looker Look ' + LOOKER_CONFIG.LOOK_ID],
+    ['Look URL:',    LOOKER_CONFIG.BASE + '/looks/' + LOOKER_CONFIG.LOOK_ID],
+    ['Updated:',     new Date()]
+  ]);
+
+  log('Looker sheet written: ' + (data.length - 1) + ' data rows + 1 header');
+}
+
+
+// ── RECON ────────────────────────────────────────────────────────────
+// buildRecon moved to recon_summary.gs (WM | Distribution | Variances
+// summary). The old 1-to-1 matching version and buildDailyTotals were
+// removed — do not re-add them here, Apps Script shares one namespace
+// across all files and a duplicate name silently overrides the other.
+
+
+// ── RECON V2 ─────────────────────────────────────────────────────────
+// Ручная корректировка курса (колонки G / H):
+//   G  Manual rate    — аналитик сам вписывает уточнённый курс для конкретной
+//                       транзакции (например, пришло исправление в Re:-письме).
+//   H  Adjusted total — формула: G пусто → D (как распарсено),
+//                       G заполнено → ROUND(B × G, 2).
+//   D3 (Distribution, Local) = SUM(H), D1 (Variance, Local) = D3 − D2 — формулы,
+//   поэтому варианс пересчитывается сразу после ввода курса, без перезапуска.
+//
+// Перезапуск скрипта G не теряет: перед очисткой листа ручные курсы читаются
+// и привязываются к транзакции по ключу (source|amount|rate|date|type), а после
+// перестроения возвращаются к той же транзакции — даже если строки сдвинулись
+// (пришло второе письмо, pagos и т.п.). Если транзакции больше нет в данных,
+// курс не теряется молча: он попадает в WARNING в log и в блок под таблицей.
+// Чистит G аналитик сам.
+const RECON_V2_FIRST_ROW = 4;   // первая строка детализации
+const RECON_V2_MANUAL_BG = '#FCE5CD';
+
+function buildReconV2(ss, mailSheet, prevDaySheet, pagosSheet, lookerSheet, log) {
+
+  const YELLOW = '#FFEB9C';
+  const FIRST  = RECON_V2_FIRST_ROW;
+  const tz     = ss.getSpreadsheetTimeZone();
+
+  const reconV2Sheet = getOrCreateSheet(ss, 'recon_v2');
+
+  // ── 0. Сохранить ручные курсы из G ДО очистки листа ────────────────
+  const manual = reconV2ReadManualRates_(reconV2Sheet, tz, log);
+  log('[recon_v2] Manual rates found in G before rebuild: ' + manual.count);
+
+  reconV2Sheet.clearContents();
+
+  // Clear background and formatting
+  const maxR = Math.max(reconV2Sheet.getMaxRows(), 1);
+  const maxC = Math.max(reconV2Sheet.getMaxColumns(), 1);
+  reconV2Sheet.getRange(1, 1, maxR, maxC).setBackground(null).setFontWeight('normal');
+
+  log('[recon_v2] Sheet cleared');
+
+  // ── Read dist (mail + mail_prev_day + optional Pagos adicionales) ──
+  const distRows = [];
+
+  function readDistSheetV2(sheet, sourceLabel) {
+    const last = sheet.getLastRow();
+    if (last < 2) return;
+    const allData = sheet.getRange(2, 1, last - 1, 5).getValues();
+    for (const row of allData) {
+      const val = row[0];
+      if (val === '' || val === 'Source:' || isNaN(Number(val))) break;
+      // FILTER: skip Celex transactions
+      if (String(row[4]).trim().toLowerCase() === 'celex') continue;
+      distRows.push({
+        amount:  Number(row[0]),   // col A — Amount
+        rate:    row[1],           // col B — Rate
+        total:   Number(row[2]),   // col C — Total (converted)
+        date:    row[3],           // col D — Date
+        type:    row[4],           // col E — Type
+        source:  sourceLabel || '' // blank for mail/prev_day (unchanged), labeled for Pagos adicionales
+      });
+    }
+  }
+
+  readDistSheetV2(mailSheet);
+  readDistSheetV2(prevDaySheet);
+  readDistSheetV2(pagosSheet, 'Pagos adicionales'); // merges into Distribution total when present; no-op when sheet is empty (normal case)
+  log('[recon_v2] Dist rows (excl. Celex, incl. Pagos adicionales if present): ' + distRows.length);
+
+  // ── Compute TOTAL for dist ────────────────────────────────────────
+  let distTotalAmount    = 0;
+  let distTotalConverted = 0;
+  for (const r of distRows) {
+    distTotalAmount    += r.amount;
+    distTotalConverted += r.total;
+  }
+
+  // ── Read looker ───────────────────────────────────────────────────
+  const lookerLast = lookerSheet.getLastRow();
+  let lookerTotalAmount    = 0;
+  let lookerTotalConverted = 0;
+  let lookerExcluded       = 0;
+
+  if (lookerLast >= 2) {
+    const allData = lookerSheet.getRange(2, 1, lookerLast - 1, 10).getValues();
+    for (const row of allData) {
+      const val = row[0];
+      if (val === '' || val === 'Source file:') break;
+      // FILTER: skip excluded statuses (col C) — same rule as recon, so the
+      // WM total here and the recon matching always see the same population
+      if (isExcludedLookerStatus_(row[2])) {
+        lookerExcluded++;
+        log('[recon_v2][SKIP] Looker row ' + row[0] + ' | amount ' + row[8] + ' — status "' + row[2] + '" excluded from WM total');
+        continue;
+      }
+      // col I (index 8) — Amount; col J (index 9) — Local currency amount
+      const amountRaw    = String(row[8]).replace(/,/g, '');
+      const convertedRaw = String(row[9]).replace(/,/g, '');
+      lookerTotalAmount    += isNaN(Number(amountRaw))    ? 0 : Number(amountRaw);
+      lookerTotalConverted += isNaN(Number(convertedRaw)) ? 0 : Number(convertedRaw);
+    }
+  }
+  log('[recon_v2] Looker totalAmount=' + lookerTotalAmount + ' | totalConverted=' + lookerTotalConverted + ' | rows excluded by status: ' + lookerExcluded);
+
+  // ── Variance (USD — значением, как раньше) ────────────────────────
+  const varianceAmount = distTotalAmount - lookerTotalAmount;
+  const n       = distRows.length;
+  const lastRow = FIRST + n - 1;
+
+  // ── Row 1: Variance ───────────────────────────────────────────────
+  reconV2Sheet.getRange(1, 1).setValue('Variance');
+  reconV2Sheet.getRange(1, 2).setValue(varianceAmount);
+  // C1 — empty
+  reconV2Sheet.getRange(1, 4).setFormula('=D3-D2');            // Local: Dist (adjusted) − WM
+
+  // ── Row 2: WM (looker totals) ─────────────────────────────────────
+  reconV2Sheet.getRange(2, 1).setValue('WM');
+  reconV2Sheet.getRange(2, 2).setValue(lookerTotalAmount);
+  // C2 — empty
+  reconV2Sheet.getRange(2, 4).setValue(lookerTotalConverted);
+
+  // ── Row 3: Distribution (dist totals) ─────────────────────────────
+  reconV2Sheet.getRange(3, 1).setValue('Distribution');
+  reconV2Sheet.getRange(3, 2).setValue(distTotalAmount);
+  // C3 — empty
+  if (n > 0) {
+    reconV2Sheet.getRange(3, 4).setFormula('=SUM(H' + FIRST + ':H' + lastRow + ')');  // с учётом ручных курсов
+  } else {
+    reconV2Sheet.getRange(3, 4).setValue(0);
+  }
+
+  // Заголовки ручных колонок
+  reconV2Sheet.getRange(3, 7, 1, 2).setValues([['Manual rate', 'Adjusted total']]).setFontWeight('bold');
+
+  // Bold font for A1:A3
+  reconV2Sheet.getRange(1, 1, 3, 1).setFontWeight('bold');
+
+  // Yellow background for rows 1 and 2 (Variance and WM)
+  reconV2Sheet.getRange(1, 1, 2, 4).setBackground(YELLOW);
+
+  // ── Rows 4+: detail from dist (mail + mail_prev_day + Pagos adicionales) ─
+  let applied = 0;
+  if (n > 0) {
+    const dataRows = distRows.map(r => [
+      r.source,  // A — blank for mail/prev_day (unchanged behavior), labeled for Pagos adicionales
+      r.amount,  // B — Amount
+      r.rate,    // C — Rate
+      r.total,   // D — Total (converted)
+      r.date,    // E — Date
+      r.type     // F — Type
+    ]);
+
+    reconV2Sheet.getRange(FIRST, 1, n, 6).setValues(dataRows);
+
+    // Format Rate (col C) as number with 4 decimals
+    reconV2Sheet.getRange(FIRST, 3, n, 1).setNumberFormat('0.0000');
+
+    // G — вернуть ручные курсы к своим транзакциям
+    const gValues = distRows.map(r => {
+      const key = reconV2RowKey_(r.source, r.amount, r.rate, r.date, r.type, tz);
+      const q = manual.map[key];
+      if (q && q.length) {
+        const g = q.shift();
+        applied++;
+        log('[recon_v2] Manual rate re-applied: ' + r.type + ' ' + r.amount + ' | parsed ' + r.rate + ' → manual ' + g);
+        return [g];
+      }
+      return [''];
+    });
+    reconV2Sheet.getRange(FIRST, 7, n, 1).setValues(gValues).setNumberFormat('0.0000');
+
+    // Ввод в G — только число > 0 (опечатка вида "18,12" как текст не пройдёт)
+    reconV2Sheet.getRange(FIRST, 7, n, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation()
+        .requireNumberGreaterThan(0)
+        .setAllowInvalid(false)
+        .setHelpText('Manual FX rate for this transaction (e.g. 18.1200). Leave blank to use the parsed rate in column C.')
+        .build()
+    );
+
+    // H — Adjusted total (формула, пересчитывается сразу при вводе в G)
+    reconV2Sheet.getRange(FIRST, 8, n, 1)
+      .setFormulaR1C1('=IF(RC7="",RC4,ROUND(RC2*RC7,2))')
+      .setNumberFormat('#,##0.00');
+
+    // Подсветка строк с ручным курсом
+    const hl = reconV2Sheet.getRange(FIRST, 1, n, 8);
+    reconV2Sheet.setConditionalFormatRules([
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenFormulaSatisfied('=$G' + FIRST + '<>""')
+        .setBackground(RECON_V2_MANUAL_BG)
+        .setRanges([hl])
+        .build()
+    ]);
+  } else {
+    reconV2Sheet.setConditionalFormatRules([]);
+  }
+
+  // ── Ручные курсы, которые не к чему привязать ─────────────────────
+  const dropped = [];
+  for (const key in manual.map) {
+    for (const g of manual.map[key]) dropped.push({ key: key, rate: g });
+  }
+  if (dropped.length) {
+    const startRow = Math.max(lastRow, FIRST - 1) + 2;
+    const block = [['Manual rates NOT re-applied (transaction no longer in data):', '']]
+      .concat(dropped.map(d => [d.key, d.rate]));
+    reconV2Sheet.getRange(startRow, 1, block.length, 2).setValues(block);
+    reconV2Sheet.getRange(startRow, 1).setFontWeight('bold').setFontColor('#C00000');
+    dropped.forEach(d => log('[recon_v2] WARNING: manual rate ' + d.rate + ' dropped — transaction not found: ' + d.key));
+  }
+
+  reconV2Sheet.autoResizeColumns(1, 8);
+
+  log('[recon_v2] Manual rates: saved ' + manual.count + ', re-applied ' + applied + ', dropped ' + dropped.length +
+      ' | Dist Local parsed=' + distTotalConverted + ' (D3 shows adjusted total)');
+  log('[recon_v2] Done. Dist rows written: ' + n);
+}
+
+
+// Читает ручные курсы из G текущего листа (до очистки).
+// Возвращает { map: { key: [rate, ...] }, count } — массив, а не одно значение,
+// чтобы корректно разнести курсы по полностью одинаковым строкам (по порядку).
+function reconV2ReadManualRates_(sheet, tz, log) {
+  const res = { map: {}, count: 0 };
+  const last = sheet.getLastRow();
+  if (last < RECON_V2_FIRST_ROW) return res;
+
+  const data = sheet.getRange(RECON_V2_FIRST_ROW, 1, last - RECON_V2_FIRST_ROW + 1, 7).getValues();
+  for (const row of data) {
+    const g = row[6];
+    if (g === '' || g === null) continue;
+    if (row[1] === '' || isNaN(Number(row[1]))) {
+      // строка без транзакции (например, старый блок "NOT re-applied") — пропускаем
+      continue;
+    }
+    const key = reconV2RowKey_(row[0], row[1], row[2], row[4], row[5], tz);
+    (res.map[key] = res.map[key] || []).push(g);
+    res.count++;
+  }
+  return res;
+}
+
+// Ключ транзакции: source | amount | rate | date | type
+function reconV2RowKey_(source, amount, rate, date, type, tz) {
+  const d = (date instanceof Date)
+    ? Utilities.formatDate(date, tz, 'yyyy-MM-dd')
+    : String(date || '').trim();
+  return [
+    String(source || '').trim(),
+    (Number(amount) || 0).toFixed(2),
+    (Number(rate) || 0).toFixed(6),
+    d,
+    String(type || '').trim().toLowerCase()
+  ].join('|');
+}
+
+
+// ── Date normalization ────────────────────────────────────────────────
+// Used by the recon-by-date script for log diagnostics (which payment
+// dates came back from Looker). The new recon (recon_summary.gs) has its
+// own date helpers and does not depend on this function.
+function normalizeDateKey(dateVal) {
+  if (!dateVal) return 'unknown';
+  if (dateVal instanceof Date) {
+    return Utilities.formatDate(dateVal, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  }
+  const s = String(dateVal).trim();
+  // "07-May" → "07/05/2026"
+  const m = s.match(/^(\d{1,2})-([A-Za-z]{3})$/);
+  if (m) {
+    const months = { Jan:1,Feb:2,Mar:3,Apr:4,May:5,Jun:6,Jul:7,Aug:8,Sep:9,Oct:10,Nov:11,Dec:12 };
+    const day    = m[1].padStart(2, '0');
+    const mon    = String(months[m[2]] || 0).padStart(2, '0');
+    const year   = new Date().getFullYear();
+    return day + '/' + mon + '/' + year;
+  }
+  // "2026-05-08" → "08/05/2026"
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return iso[3] + '/' + iso[2] + '/' + iso[1];
+  }
+  return s;
+}
+
+
+// ── Pagos adicionales (optional 3rd source, same-day EST only) ────────
+// Looks for an email whose subject contains "Pagos adicionales" ANYWHERE
+// (case-insensitive), received on the same calendar day (in EST_TZ) the
+// script runs. This is NOT a daily occurrence (roughly weekly) — returning
+// null is the normal case and the rest of the script proceeds unaffected.
+function findPagosAdicionalesCandidate_(log) {
+  const todayKey = Utilities.formatDate(new Date(), EST_TZ, 'dd/MM/yyyy');
+
+  const threads = GmailApp.search('"Pagos adicionales"', 0, 50);
+  log('[Pagos adicionales] Threads found: ' + threads.length);
+
+  const candidates = [];
+
+  for (const thread of threads) {
+    const messages = thread.getMessages();
+    for (const msg of messages) {
+      const subject = msg.getSubject();
+
+      // Defensive re-check: phrase must actually appear in the subject, anywhere in it
+      if (!/pagos\s+adicionales/i.test(subject)) continue;
+
+      // Same rule as Distribucion block — ignore replies/forwards
+      if (/^\s*(RE|Re|FW|Fwd)\s*:/i.test(subject)) {
+        log('[Pagos adicionales][SKIP] "' + subject + '" — reply/forward ignored');
+        continue;
+      }
+
+      // Must be dated today (script run day) in EST_TZ — same zone as the
+      // main Distribucion block, so both sources agree on what "today" means
+      // regardless of the Apps Script project's own default timezone.
+      const msgDateKey = Utilities.formatDate(msg.getDate(), EST_TZ, 'dd/MM/yyyy');
+      if (msgDateKey !== todayKey) {
+        continue;
+      }
+
+      const body = getMessageBody(msg);
+      const rows = parseTableFromBody(body);
+      log('[Pagos adicionales][CHECK] "' + subject + '" | ' + msg.getDate() + ' | rows: ' + rows.length);
+
+      if (rows.length > 0) {
+        candidates.push({ msg, rows });
+      } else {
+        log('[Pagos adicionales][SKIP] No table rows found in: "' + subject + '"');
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Rare but possible: more than one match today — take the most recent one,
+  // same rule already used for mail vs mail_prev_day.
+  candidates.sort((a, b) => b.msg.getDate() - a.msg.getDate());
+  if (candidates.length > 1) {
+    log('[Pagos adicionales] WARNING: ' + candidates.length + ' matching emails found today — using the most recent one.');
+  }
+
+  return candidates[0];
+}
+
+
+// ── Common utilities ──────────────────────────────────────────────────
+function getMessageBody(msg) {
+  const plain = msg.getPlainBody();
+  if (plain && plain.trim().length > 0) return plain;
+  const html = msg.getBody();
+  if (html) {
+    return html
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/tr>/gi, '\n')
+      .replace(/<\/td>/gi, '   ')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+  }
+  return '';
+}
+
+function parseTableFromBody(body) {
+  const rows       = [];
+  const normalized = body.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines      = normalized.split('\n');
+
+  const singlePattern = /^\s*([\d,]+\.\d{2})\s+([\d.]+)\s+([\d,]+\.\d{2})\s+(\d{1,2}-[A-Za-z]{3})\s+([A-Z][A-Za-z]{1,7})\s*$/;
+  const line1Pattern  = /^\s*([\d,]+\.\d{2})\s+([\d.]+)\s*$/;
+  const line2Pattern  = /^\s*([\d,]+\.\d{2})\s+(\d{1,2}-[A-Za-z]{3})\s+([A-Z][A-Za-z]{1,7})\s*$/;
+
+  // 3rd format: one value per line (e.g. an HTML/Word table where each
+  // cell becomes its own paragraph), blank lines allowed in between. Tried
+  // ONLY when the two formats above don't match at the current line — purely
+  // additive, doesn't change matching/priority of the existing two formats.
+  const soloAmountPattern = /^\s*([\d,]+\.\d{2})\s*$/;
+  const soloRatePattern   = /^\s*([\d.]+)\s*$/;
+  const soloTotalPattern  = /^\s*([\d,]+\.\d{2})\s*$/;
+  const soloDatePattern   = /^\s*(\d{1,2}-[A-Za-z]{3})\s*$/;
+  const soloTypePattern   = /^\s*([A-Z][A-Za-z]{1,7})\s*$/;
+
+  // Reads amount/rate/total/date/type as 5 separate non-blank lines starting
+  // at startIdx, skipping any blank lines in between. Returns null (no
+  // match, nothing consumed) if the sequence breaks at any point.
+  function tryOneValuePerLine_(startIdx) {
+    let idx = startIdx;
+    const values  = [];
+    const pats    = [soloAmountPattern, soloRatePattern, soloTotalPattern, soloDatePattern, soloTypePattern];
+
+    for (let p = 0; p < pats.length; p++) {
+      while (idx < lines.length && lines[idx].trim() === '') idx++; // skip blank lines
+      if (idx >= lines.length) return null;
+      const m = lines[idx].match(pats[p]);
+      if (!m) return null;
+      values.push(m[1]);
+      idx++;
+    }
+
+    return {
+      row: [
+        parseFloat(values[0].replace(/,/g, '')),
+        parseFloat(values[1]),
+        parseFloat(values[2].replace(/,/g, '')),
+        values[3].trim(),
+        values[4].trim()
+      ],
+      nextIndex: idx
+    };
+  }
+
+  let i = 0;
+  while (i < lines.length) {
+    const line   = lines[i];
+    const single = line.match(singlePattern);
+    if (single) {
+      rows.push([
+        parseFloat(single[1].replace(/,/g, '')),
+        parseFloat(single[2]),
+        parseFloat(single[3].replace(/,/g, '')),
+        single[4].trim(),
+        single[5].trim()
+      ]);
+      i++; continue;
+    }
+    const m1 = line.match(line1Pattern);
+    if (m1 && i + 1 < lines.length) {
+      const m2 = lines[i + 1].match(line2Pattern);
+      if (m2) {
+        rows.push([
+          parseFloat(m1[1].replace(/,/g, '')),
+          parseFloat(m1[2]),
+          parseFloat(m2[1].replace(/,/g, '')),
+          m2[2].trim(),
+          m2[3].trim()
+        ]);
+        i += 2; continue;
+      }
+    }
+
+    // 3rd format fallback (one value per line)
+    const solo = tryOneValuePerLine_(i);
+    if (solo) {
+      rows.push(solo.row);
+      i = solo.nextIndex;
+      continue;
+    }
+
+    i++;
+  }
+  return rows;
+}
+
+function writeToSheet(msg, rows, sheet, log) {
+  log('Writing ' + rows.length + ' rows to sheet: ' + sheet.getName());
+  const headers = ['Amount', 'Rate', 'Total', 'Date', 'Type'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.getRange(2, 2, rows.length, 1).setNumberFormat('0.0000');
+  sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  sheet.autoResizeColumns(1, headers.length);
+
+  const metaRow = rows.length + 3;
+  sheet.getRange(metaRow, 1, 3, 2).setValues([
+    ['Source:',     msg.getSubject()],
+    ['Email date:', msg.getDate()],
+    ['Updated:',    new Date()]
+  ]);
+}
+
+function getOrCreateSheet(ss, name) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  return sheet;
+}
